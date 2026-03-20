@@ -1,0 +1,18 @@
+{
+  "theme": "light-ansi",
+  "numStartups": 1,
+  "installMethod": "native",
+  "autoUpdates": false,
+  "bypassPermissionsModeAccepted": true,
+  "effortLevel": "medium",
+  "primaryModel": "claude-sonnet-4-6",
+  "hasCompletedOnboarding": true,
+  "lastOnboardingVersion": "2.1.80",
+  "projects": {
+    "/work": {
+      "allowedTools": [],
+      "hasTrustDialogAccepted": true,
+      "hasCompletedProjectOnboarding": true
+    }
+  }
+}

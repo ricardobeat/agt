@@ -1,0 +1,306 @@
+#!/bin/zsh
+set -euo pipefail
+
+AGT_DEFAULT_IMAGE="agt-sandbox"
+AGT_DIR="$(cd "$(dirname "$(readlink -f "$0" || realpath "$0")")" && pwd)"
+
+red()    { printf "\033[31m%s\033[0m\n" "$1" >&2; }
+green()  { printf "\033[32m%s\033[0m\n" "$1"; }
+yellow() { printf "\033[33m%s\033[0m\n" "$1"; }
+bold()   { printf "\033[1m%s\033[0m\n" "$1"; }
+
+usage() {
+  cat <<EOF
+agt — sandboxed AI agent development tool
+
+Usage:
+  agt start <branch> [prompt...]   Create worktree + container, run Claude inside
+  agt enter <branch>               Create worktree + container, drop into a shell
+  agt build [dockerfile]           Build image from a Dockerfile (default: $AGT_DIR/Dockerfile)
+  agt list                         List running agt containers
+  agt stop <branch>                Stop a running container
+  agt clean <branch>               Remove worktree and container
+
+Options:
+  --image <name>                   Use a custom image (skips auto-build)
+
+Examples:
+  agt start my-feature
+  agt enter my-feature
+  agt start my-feature --image my-custom-image
+  agt build ./Dockerfile
+  agt build --image my-tag ./path/to/Dockerfile
+
+EOF
+  exit 1
+}
+
+# --- helpers ---
+
+git_root() {
+  git rev-parse --show-toplevel 2>/dev/null || {
+    red "Error: not inside a git repository"
+    exit 1
+  }
+}
+
+resolve_image() {
+  local root
+  root="$(git_root 2>/dev/null || true)"
+  if [[ -n "$root" && -f "$root/Dockerfile.agt" ]]; then
+    echo "$root/Dockerfile.agt"
+  elif [[ -f "$AGT_DIR/Dockerfile" ]]; then
+    echo "$AGT_DIR/Dockerfile"
+  fi
+}
+
+image_exists() {
+  container image list 2>/dev/null | grep -q "$1"
+}
+
+container_name() {
+  echo "agt-${1//\//-}"
+}
+
+# Prepare worktree, mounts, auth, and image — sets shared variables
+setup_container() {
+  local image="$AGT_DEFAULT_IMAGE"
+
+  # Parse --image flag, collect remaining args
+  local -a remaining=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --image) image="$2"; shift 2 ;;
+      *) remaining+=("$1"); shift ;;
+    esac
+  done
+  set -- "${remaining[@]}"
+
+  local branch="$1"; shift || true
+
+  # Export for caller
+  _agt_image="$image"
+  _agt_branch="$branch"
+  _agt_remaining_args="$*"
+  _agt_cname="$(container_name "$branch")"
+
+  # Ensure image exists
+  if ! image_exists "$image"; then
+    if [[ "$image" == "$AGT_DEFAULT_IMAGE" ]]; then
+      local dockerfile
+      dockerfile="$(resolve_image)"
+      if [[ -n "$dockerfile" ]]; then
+        yellow "Image not found, building from $dockerfile..."
+        cmd_build "$image" "$dockerfile"
+      else
+        red "Error: no image '$image' found and no Dockerfile available to build one."
+        red "Provide a Dockerfile.agt in your repo root, or run: agt build <dockerfile>"
+        exit 1
+      fi
+    else
+      red "Error: image '$image' not found. Build it first or check the name."
+      exit 1
+    fi
+  fi
+
+  # Set up working directory — git worktree if in a repo, plain dir otherwise
+  local root
+  root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
+  if [[ -n "$root" ]]; then
+    _agt_worktree="$root/.worktrees/$branch"
+    if [[ ! -d "$_agt_worktree" ]]; then
+      bold "Creating worktree for branch '$branch'..."
+      git -C "$root" worktree add "$_agt_worktree" -b "$branch" 2>/dev/null \
+        || git -C "$root" worktree add "$_agt_worktree" "$branch"
+      green "Worktree created at $_agt_worktree"
+    else
+      yellow "Worktree already exists at $_agt_worktree"
+    fi
+
+    # Copy .env files (untracked by git) into worktree, preserving structure
+    git -C "$root" ls-files --others --exclude-standard | grep '\.env' | while read -r relpath; do
+      local destdir="$_agt_worktree/$(dirname "$relpath")"
+      mkdir -p "$destdir"
+      cp "$root/$relpath" "$destdir/"
+    done
+  else
+    _agt_worktree="$PWD"
+    bold "Using current directory as workspace"
+  fi
+
+  # Package manager cache mounts
+  _agt_mounts=()
+  if [[ -d "$HOME/Library/pnpm/store" ]]; then
+    _agt_mounts+=(-v "$HOME/Library/pnpm/store:/cache/pnpm")
+  fi
+  if [[ -d "$HOME/.npm" ]]; then
+    _agt_mounts+=(-v "$HOME/.npm:/cache/npm")
+  fi
+  if [[ -d "$HOME/.bun/install/cache" ]]; then
+    _agt_mounts+=(-v "$HOME/.bun/install/cache:/cache/bun")
+  fi
+
+  # Claude config — isolated copy, never writes back to host
+  _agt_env=()
+  local agt_config_dir="$HOME/.agt/claude-config"
+  mkdir -p "$agt_config_dir"
+
+  if [[ -d "$HOME/.claude" ]]; then
+    rsync -a --delete \
+      --exclude '.credentials.json' \
+      --exclude 'sessions' \
+      --exclude 'history.jsonl' \
+      --exclude 'todos' \
+      --exclude 'statsig' \
+      --exclude 'telemetry' \
+      --exclude 'cache' \
+      "$HOME/.claude/" "$agt_config_dir/"
+  fi
+
+  cp -f "$AGT_DIR/claude.json" "$agt_config_dir/.claude.json"
+
+  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    _agt_env+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+  else
+    local creds_json
+    creds_json="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
+    if [[ -n "$creds_json" ]]; then
+      echo "$creds_json" > "$agt_config_dir/.credentials.json"
+      chmod 600 "$agt_config_dir/.credentials.json"
+    else
+      yellow "Warning: no API key or OAuth token found. Run 'claude' on the host to authenticate first."
+    fi
+  fi
+
+  _agt_mounts+=(-v "$agt_config_dir:$agt_config_dir")
+  _agt_env+=(-e "CLAUDE_CONFIG_DIR=$agt_config_dir")
+}
+
+run_container() {
+  bold "Starting container $_agt_cname..."
+  container run -it --rm \
+    --name "$_agt_cname" \
+    -v "$_agt_worktree:/work" \
+    "${_agt_mounts[@]}" \
+    "${_agt_env[@]}" \
+    -w /work \
+    "$_agt_image" \
+    "$@"
+}
+
+# --- commands ---
+
+cmd_build() {
+  local tag="$1"
+  local dockerfile="$2"
+
+  if [[ ! -f "$dockerfile" ]]; then
+    red "Error: Dockerfile not found at $dockerfile"
+    exit 1
+  fi
+
+  local context
+  context="$(dirname "$dockerfile")"
+  bold "Building $tag from $dockerfile..."
+  container build --tag "$tag" --file "$dockerfile" "$context"
+  green "Image $tag built successfully"
+}
+
+cmd_start() {
+  setup_container "$@"
+  local -a claude_args=(claude --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official)
+
+  # Resume last session if one exists for this working directory
+  local agt_config_dir="$HOME/.agt/claude-config"
+  if [[ -d "$agt_config_dir/projects" ]] && find "$agt_config_dir/sessions" -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+    claude_args+=(--continue)
+  fi
+
+  if [[ -n "$_agt_remaining_args" ]]; then
+    claude_args+=(-p "$_agt_remaining_args")
+  fi
+  run_container "${claude_args[@]}"
+}
+
+cmd_enter() {
+  setup_container "$@"
+  run_container zsh
+}
+
+cmd_list() {
+  container ls 2>/dev/null | grep -E "^(ID|agt-)" || echo "No agt containers running"
+}
+
+cmd_stop() {
+  local branch="$1"
+  local cname
+  cname="$(container_name "$branch")"
+  bold "Stopping $cname..."
+  container stop "$cname"
+  green "Stopped $cname"
+}
+
+cmd_clean() {
+  local branch="$1"
+  local root
+  root="$(git_root)"
+  local worktree_dir="$root/.worktrees/$branch"
+  local cname
+  cname="$(container_name "$branch")"
+
+  container stop "$cname" 2>/dev/null && yellow "Stopped container $cname"
+
+  if [[ -d "$worktree_dir" ]]; then
+    git -C "$root" worktree remove "$worktree_dir" --force
+    green "Removed worktree at $worktree_dir"
+  fi
+
+  git -C "$root" branch -D "$branch" 2>/dev/null && yellow "Deleted branch $branch"
+
+  green "Cleaned up $branch"
+}
+
+# --- main ---
+
+[[ $# -lt 1 ]] && usage
+
+case "$1" in
+  start)
+    [[ $# -lt 2 ]] && { red "Usage: agt start <branch> [prompt...]"; exit 1; }
+    shift; cmd_start "$@"
+    ;;
+  enter)
+    [[ $# -lt 2 ]] && { red "Usage: agt enter <branch>"; exit 1; }
+    shift; cmd_enter "$@"
+    ;;
+  build)
+    shift
+    local build_tag="$AGT_DEFAULT_IMAGE"
+    local build_file=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --image) build_tag="$2"; shift 2 ;;
+        *) build_file="$1"; shift ;;
+      esac
+    done
+    [[ -z "$build_file" ]] && build_file="$(resolve_image)"
+    [[ -z "$build_file" ]] && { red "Usage: agt build [--image tag] <dockerfile>"; exit 1; }
+    cmd_build "$build_tag" "$build_file"
+    ;;
+  list|ls)
+    cmd_list
+    ;;
+  stop)
+    [[ $# -lt 2 ]] && { red "Usage: agt stop <branch>"; exit 1; }
+    cmd_stop "$2"
+    ;;
+  clean)
+    [[ $# -lt 2 ]] && { red "Usage: agt clean <branch>"; exit 1; }
+    cmd_clean "$2"
+    ;;
+  *)
+    red "Unknown command: $1"
+    usage
+    ;;
+esac
