@@ -9,20 +9,69 @@ green()  { printf "\033[32m%s\033[0m\n" "$1"; }
 yellow() { printf "\033[33m%s\033[0m\n" "$1"; }
 bold()   { printf "\033[1m%s\033[0m\n" "$1"; }
 
+# --- config ---
+
+# Reads a key from a TOML file (flat keys only, e.g. "execution.mode")
+toml_get() {
+  local file="$1" key="$2"
+  local section="" field=""
+  section="${key%%.*}"
+  field="${key#*.}"
+  awk -v sec="$section" -v key="$field" '
+    /^\[/ { in_sec = ($0 == "[" sec "]"); next }
+    in_sec && match($0, "^" key "[ \t]*=[ \t]*") {
+      val = substr($0, RSTART + RLENGTH)
+      gsub(/^["'\''"]|["'\''"]$/, "", val)
+      print val
+      exit
+    }
+  ' "$file"
+}
+
+load_config() {
+  AGT_MODE="container"
+
+  local config_file=""
+  if [[ -f "./agt.toml" ]]; then
+    config_file="./agt.toml"
+  elif [[ -f "$HOME/.config/agt/config.toml" ]]; then
+    config_file="$HOME/.config/agt/config.toml"
+  fi
+
+  if [[ -n "$config_file" ]]; then
+    local mode
+    mode="$(toml_get "$config_file" "execution.mode")"
+    if [[ -n "$mode" ]]; then
+      AGT_MODE="$mode"
+    fi
+  fi
+}
+
+load_config
+
 usage() {
   cat <<EOF
 agt — sandboxed AI agent development tool
 
 Usage:
-  agt start <branch> [prompt...]   Create worktree + container, run Claude inside
-  agt enter <branch>               Create worktree + container, drop into a shell
-  agt build [dockerfile]           Build image from a Dockerfile (default: $AGT_DIR/Dockerfile)
+  agt start <branch> [prompt...]   Create worktree + sandbox, run Claude inside
+  agt enter <branch>               Create worktree + sandbox, drop into a shell
+  agt build [dockerfile]           Build container image (container mode only)
   agt list                         List running agt containers
   agt stop <branch>                Stop a running container
   agt clean <branch>               Remove worktree and container
 
 Options:
-  --image <name>                   Use a custom image (skips auto-build)
+  --image <name>                   Use a custom image (container mode, skips auto-build)
+  --mode <container|sandbox>       Override execution mode
+
+Execution modes (set via agt.toml):
+  container                        Run inside an Apple container (default)
+  sandbox                          Run via sandbox-exec (macOS seatbelt)
+
+Config file (agt.toml) is loaded from ./agt.toml or ~/.config/agt/config.toml:
+  [execution]
+  mode = "sandbox"   # or "container"
 
 Examples:
   agt start my-feature
@@ -62,15 +111,82 @@ container_name() {
   echo "agt-${1//\//-}"
 }
 
+# --- sandbox-exec support ---
+
+generate_sandbox_profile() {
+  local worktree="$1"
+  cat <<SBEOF
+(version 1)
+(deny default)
+
+;; Process, IPC, mach, and system calls — needed for shells and tools to function
+(allow process*)
+(allow signal)
+(allow sysctl*)
+(allow mach*)
+(allow ipc*)
+(allow file-ioctl)
+
+;; Metadata and xattr reads must be unrestricted for path traversal
+(allow file-read-metadata)
+(allow file-read-xattr)
+
+;; File content reads: system paths + worktree + specific home dirs only
+(allow file-read-data
+  (literal "/")
+  (subpath "/Applications")
+  (subpath "/usr")
+  (subpath "/bin")
+  (subpath "/sbin")
+  (subpath "/cores")
+  (subpath "/home")
+  (subpath "/Library")
+  (subpath "/System")
+  (subpath "/private")
+  (subpath "/dev")
+  (subpath "/opt")
+  (subpath "/tmp")
+  (subpath "/var")
+  (subpath "/Volumes")
+  (subpath "$worktree")
+  (subpath "$HOME/.agt")
+  (subpath "$HOME/.claude")
+  (subpath "$HOME/.local")
+  (subpath "$HOME/.bun")
+  (subpath "$HOME/.npm")
+  (subpath "$HOME/.nvm")
+  (subpath "$HOME/.mise")
+  (subpath "$HOME/.config/mise")
+  (subpath "$HOME/Library")
+  (literal "$HOME/.zshrc")
+  (literal "$HOME/.zshenv")
+  (literal "$HOME/.zprofile")
+  (literal "$HOME/.zlogin"))
+
+;; Writes: worktree, agt config, temp, and dev only
+(allow file-write*
+  (subpath "/dev")
+  (subpath "/tmp")
+  (subpath "/private/tmp")
+  (subpath "/private/var/folders")
+  (subpath "$worktree")
+  (subpath "$HOME/.agt"))
+
+;; Network (needed for Claude API)
+(allow network*)
+SBEOF
+}
+
 # Prepare worktree, mounts, auth, and image — sets shared variables
-setup_container() {
+setup_env() {
   local image="$AGT_DEFAULT_IMAGE"
 
-  # Parse --image flag, collect remaining args
+  # Parse flags, collect remaining args
   local -a remaining=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --image) image="$2"; shift 2 ;;
+      --mode) AGT_MODE="$2"; shift 2 ;;
       *) remaining+=("$1"); shift ;;
     esac
   done
@@ -84,22 +200,24 @@ setup_container() {
   _agt_remaining_args="$*"
   _agt_cname="$(container_name "$branch")"
 
-  # Ensure image exists
-  if ! image_exists "$image"; then
-    if [[ "$image" == "$AGT_DEFAULT_IMAGE" ]]; then
-      local dockerfile
-      dockerfile="$(resolve_image)"
-      if [[ -n "$dockerfile" ]]; then
-        yellow "Image not found, building from $dockerfile..."
-        cmd_build "$image" "$dockerfile"
+  # Ensure image exists (container mode only)
+  if [[ "$AGT_MODE" == "container" ]]; then
+    if ! image_exists "$image"; then
+      if [[ "$image" == "$AGT_DEFAULT_IMAGE" ]]; then
+        local dockerfile
+        dockerfile="$(resolve_image)"
+        if [[ -n "$dockerfile" ]]; then
+          yellow "Image not found, building from $dockerfile..."
+          cmd_build "$image" "$dockerfile"
+        else
+          red "Error: no image '$image' found and no Dockerfile available to build one."
+          red "Provide a Dockerfile.agt in your repo root, or run: agt build <dockerfile>"
+          exit 1
+        fi
       else
-        red "Error: no image '$image' found and no Dockerfile available to build one."
-        red "Provide a Dockerfile.agt in your repo root, or run: agt build <dockerfile>"
+        red "Error: image '$image' not found. Build it first or check the name."
         exit 1
       fi
-    else
-      red "Error: image '$image' not found. Build it first or check the name."
-      exit 1
     fi
   fi
 
@@ -127,18 +245,6 @@ setup_container() {
   else
     _agt_worktree="$PWD"
     bold "Using current directory as workspace"
-  fi
-
-  # Package manager cache mounts
-  _agt_mounts=()
-  if [[ -d "$HOME/Library/pnpm/store" ]]; then
-    _agt_mounts+=(-v "$HOME/Library/pnpm/store:/cache/pnpm")
-  fi
-  if [[ -d "$HOME/.npm" ]]; then
-    _agt_mounts+=(-v "$HOME/.npm:/cache/npm")
-  fi
-  if [[ -d "$HOME/.bun/install/cache" ]]; then
-    _agt_mounts+=(-v "$HOME/.bun/install/cache:/cache/bun")
   fi
 
   # Claude config — isolated copy, never writes back to host
@@ -173,11 +279,27 @@ setup_container() {
     fi
   fi
 
-  _agt_mounts+=(-v "$agt_config_dir:$agt_config_dir")
-  _agt_env+=(-e "CLAUDE_CONFIG_DIR=$agt_config_dir")
+  if [[ "$AGT_MODE" == "container" ]]; then
+    # Package manager cache mounts
+    _agt_mounts=()
+    if [[ -d "$HOME/Library/pnpm/store" ]]; then
+      _agt_mounts+=(-v "$HOME/Library/pnpm/store:/cache/pnpm")
+    fi
+    if [[ -d "$HOME/.npm" ]]; then
+      _agt_mounts+=(-v "$HOME/.npm:/cache/npm")
+    fi
+    if [[ -d "$HOME/.bun/install/cache" ]]; then
+      _agt_mounts+=(-v "$HOME/.bun/install/cache:/cache/bun")
+    fi
+
+    _agt_mounts+=(-v "$agt_config_dir:$agt_config_dir")
+    _agt_env+=(-e "CLAUDE_CONFIG_DIR=$agt_config_dir")
+  else
+    _agt_env+=("CLAUDE_CONFIG_DIR=$agt_config_dir")
+  fi
 }
 
-run_container() {
+run_in_container() {
   bold "Starting container $_agt_cname..."
   container run -it --rm \
     --name "$_agt_cname" \
@@ -187,6 +309,42 @@ run_container() {
     -w /work \
     "$_agt_image" \
     "$@"
+}
+
+run_in_sandbox() {
+  local profile_file
+  profile_file="$(mktemp /tmp/agt-sandbox.XXXXXX)"
+  generate_sandbox_profile "$_agt_worktree" > "$profile_file"
+
+  bold "Starting sandbox for $_agt_branch in $_agt_worktree..."
+
+  # Create a ZDOTDIR with a .zshrc that sources the user's and adds the prompt prefix
+  local sandbox_zdotdir
+  sandbox_zdotdir="$(mktemp -d /tmp/agt-sandbox-zd.XXXXXX)"
+  cat > "$sandbox_zdotdir/.zshrc" <<'RCEOF'
+[[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc"
+PROMPT="%F{yellow}[sandbox]%f $PROMPT"
+RCEOF
+
+  # Build env string
+  local -a env_args=(AGT_SANDBOX=1 "ZDOTDIR=$sandbox_zdotdir")
+  for e in "${_agt_env[@]}"; do
+    env_args+=("$e")
+  done
+
+  sandbox-exec -f "$profile_file" \
+    /usr/bin/env "${env_args[@]}" \
+    /bin/zsh -c "cd '$_agt_worktree' && exec \"\$@\"" -- "$@"
+
+  rm -rf "$sandbox_zdotdir" "$profile_file"
+}
+
+run_agt() {
+  if [[ "$AGT_MODE" == "sandbox" ]]; then
+    run_in_sandbox "$@"
+  else
+    run_in_container "$@"
+  fi
 }
 
 # --- commands ---
@@ -208,7 +366,7 @@ cmd_build() {
 }
 
 cmd_start() {
-  setup_container "$@"
+  setup_env "$@"
   local -a claude_args=(claude --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official)
 
   # Resume last session if one exists for this working directory
@@ -220,12 +378,12 @@ cmd_start() {
   if [[ -n "$_agt_remaining_args" ]]; then
     claude_args+=(-p "$_agt_remaining_args")
   fi
-  run_container "${claude_args[@]}"
+  run_agt "${claude_args[@]}"
 }
 
 cmd_enter() {
-  setup_container "$@"
-  run_container zsh
+  setup_env "$@"
+  run_agt zsh
 }
 
 cmd_list() {
