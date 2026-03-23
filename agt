@@ -115,6 +115,13 @@ container_name() {
 
 generate_sandbox_profile() {
   local worktree="$1"
+  local git_root="${2:-}"
+  local git_root_line=""
+  local git_dir_line=""
+  if [[ -n "$git_root" ]]; then
+    git_root_line="  (subpath \"$git_root\")"
+    git_dir_line="  (subpath \"$git_root/.git\")"
+  fi
   cat <<SBEOF
 (version 1)
 (deny default)
@@ -131,7 +138,7 @@ generate_sandbox_profile() {
 (allow file-read-metadata)
 (allow file-read-xattr)
 
-;; File content reads: system paths + worktree + specific home dirs only
+;; File content reads: system paths + worktree + git root + specific home dirs only
 (allow file-read-data
   (literal "/")
   (subpath "/Applications")
@@ -149,31 +156,23 @@ generate_sandbox_profile() {
   (subpath "/var")
   (subpath "/Volumes")
   (subpath "$worktree")
-  (subpath "$HOME/.agt")
-  (subpath "$HOME/.claude")
-  (subpath "$HOME/.local")
-  (subpath "$HOME/.bun")
-  (subpath "$HOME/.npm")
-  (subpath "$HOME/.nvm")
-  (subpath "$HOME/.mise")
-  (subpath "$HOME/.config/mise")
-  (subpath "$HOME/Library")
-  (literal "$HOME/.zshrc")
-  (literal "$HOME/.zshenv")
-  (literal "$HOME/.zprofile")
-  (literal "$HOME/.zlogin"))
+$git_root_line
+  (regex #"^$HOME/\..*")
+  (subpath "$HOME/Library"))
 
-;; Writes: worktree, agt config, temp, and dev only
+;; Writes: worktree, git dir, agt config, temp, and dev only
 (allow file-write*
   (subpath "/dev")
   (subpath "/tmp")
   (subpath "/private/tmp")
   (subpath "/private/var/folders")
   (subpath "$worktree")
+$git_dir_line
   (subpath "$HOME/.agt"))
 
-;; Network (needed for Claude API)
+;; Network and sockets
 (allow network*)
+(allow system-socket)
 SBEOF
 }
 
@@ -186,7 +185,7 @@ setup_env() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --image) image="$2"; shift 2 ;;
-      --mode) AGT_MODE="$2"; shift 2 ;;
+      --mode) AGT_MODE="$2"; _agt_mode_override=1; shift 2 ;;
       *) remaining+=("$1"); shift ;;
     esac
   done
@@ -227,17 +226,27 @@ setup_env() {
 
   if [[ -n "$root" ]]; then
     _agt_worktree="$root/.worktrees/$branch"
+    _agt_git_root="$root"
+    _agt_git_dir="$root/.git"
     if [[ ! -d "$_agt_worktree" ]]; then
       bold "Creating worktree for branch '$branch'..."
       git -C "$root" worktree add "$_agt_worktree" -b "$branch" 2>/dev/null \
         || git -C "$root" worktree add "$_agt_worktree" "$branch"
       green "Worktree created at $_agt_worktree"
+      # Persist the execution mode so subsequent commands remember it
+      echo "$AGT_MODE" > "$_agt_worktree/.agt-mode"
     else
       yellow "Worktree already exists at $_agt_worktree"
+      # Recall the mode used when this worktree was created (explicit --mode overrides)
+      if [[ -n "${_agt_mode_override:-}" ]]; then
+        echo "$AGT_MODE" > "$_agt_worktree/.agt-mode"
+      elif [[ -f "$_agt_worktree/.agt-mode" ]]; then
+        AGT_MODE="$(cat "$_agt_worktree/.agt-mode")"
+      fi
     fi
 
-    # Copy .env files (untracked by git) into worktree, preserving structure
-    git -C "$root" ls-files --others --exclude-standard | grep '\.env' | while read -r relpath; do
+    # Copy .env files (ignored by git) into worktree, preserving structure
+    git -C "$root" ls-files --others --ignored --exclude-standard | grep '\.env' | while read -r relpath; do
       local destdir="$_agt_worktree/$(dirname "$relpath")"
       mkdir -p "$destdir"
       cp "$root/$relpath" "$destdir/"
@@ -248,7 +257,7 @@ setup_env() {
   fi
 
   # Claude config — isolated copy, never writes back to host
-  _agt_env=()
+  _agt_env=(-e "AGT_NAME=$_agt_cname")
   local agt_config_dir="$HOME/.agt/claude-config"
   mkdir -p "$agt_config_dir"
 
@@ -280,17 +289,19 @@ setup_env() {
   fi
 
   if [[ "$AGT_MODE" == "container" ]]; then
-    # Package manager cache mounts
+    # Shared cache directory across all agt containers
+    local cache_dir="$HOME/.agt/cache"
+    mkdir -p "$cache_dir"/{pnpm,npm,bun,mise}
+
     _agt_mounts=()
-    if [[ -d "$HOME/Library/pnpm/store" ]]; then
-      _agt_mounts+=(-v "$HOME/Library/pnpm/store:/cache/pnpm")
-    fi
-    if [[ -d "$HOME/.npm" ]]; then
-      _agt_mounts+=(-v "$HOME/.npm:/cache/npm")
-    fi
-    if [[ -d "$HOME/.bun/install/cache" ]]; then
-      _agt_mounts+=(-v "$HOME/.bun/install/cache:/cache/bun")
-    fi
+    _agt_mounts+=(-v "$cache_dir/pnpm:/cache/pnpm")
+    _agt_mounts+=(-v "$cache_dir/npm:/cache/npm")
+    _agt_mounts+=(-v "$cache_dir/bun:/cache/bun")
+    _agt_mounts+=(-v "$cache_dir/mise:/cache/mise")
+    _agt_env+=(-e "npm_config_store_dir=/cache/pnpm")
+    _agt_env+=(-e "NPM_CONFIG_CACHE=/cache/npm")
+    _agt_env+=(-e "BUN_INSTALL_CACHE_DIR=/cache/bun")
+    _agt_env+=(-e "MISE_DATA_DIR=/cache/mise")
 
     _agt_mounts+=(-v "$agt_config_dir:$agt_config_dir")
     _agt_env+=(-e "CLAUDE_CONFIG_DIR=$agt_config_dir")
@@ -299,22 +310,67 @@ setup_env() {
   fi
 }
 
-run_in_container() {
-  bold "Starting container $_agt_cname..."
-  container run -it --rm \
-    --name "$_agt_cname" \
-    -v "$_agt_worktree:/work" \
-    "${_agt_mounts[@]}" \
-    "${_agt_env[@]}" \
+container_state() {
+  container ls --all --format json 2>/dev/null \
+    | jq -r ".[] | select(.configuration.id == \"$1\") | .status" 2>/dev/null
+}
+
+ensure_container() {
+  local state
+  state="$(container_state "$_agt_cname")"
+
+  if [[ -z "$state" ]]; then
+    bold "Creating container $_agt_cname..."
+    # Mount .git at the same host path so worktree .git file references resolve
+    local -a git_mounts=()
+    if [[ -n "${_agt_git_dir:-}" ]]; then
+      git_mounts+=(-v "$_agt_git_dir:$_agt_git_dir")
+    fi
+    container run -d \
+      --name "$_agt_cname" \
+      --cpus "${AGT_CPUS:-4}" \
+      --memory "${AGT_MEMORY:-4G}" \
+      -v "$_agt_worktree:/work" \
+      "${git_mounts[@]}" \
+      "${_agt_mounts[@]}" \
+      "${_agt_env[@]}" \
+      -w /work \
+      "$_agt_image" \
+      sleep infinity
+    green "Container $_agt_cname created"
+  elif [[ "$state" == "stopped" ]]; then
+    bold "Restarting container $_agt_cname..."
+    container start "$_agt_cname"
+    green "Container $_agt_cname restarted"
+  else
+    yellow "Container $_agt_cname already running"
+  fi
+
+  # Wait for container to be ready
+  local retries=0
+  while ! container exec "$_agt_cname" true 2>/dev/null; do
+    (( retries++ >= 30 )) && { red "Container failed to become ready"; exit 1; }
+    sleep 0.2
+  done
+}
+
+exec_in_container() {
+  container exec -it \
     -w /work \
-    "$_agt_image" \
+    "${_agt_env[@]}" \
+    "$_agt_cname" \
     "$@"
+}
+
+run_in_container() {
+  ensure_container
+  exec_in_container "$@"
 }
 
 run_in_sandbox() {
   local profile_file
   profile_file="$(mktemp /tmp/agt-sandbox.XXXXXX)"
-  generate_sandbox_profile "$_agt_worktree" > "$profile_file"
+  generate_sandbox_profile "$_agt_worktree" "${_agt_git_root:-}" > "$profile_file"
 
   bold "Starting sandbox for $_agt_branch in $_agt_worktree..."
 
@@ -326,9 +382,10 @@ run_in_sandbox() {
 PROMPT="%F{yellow}[sandbox]%f $PROMPT"
 RCEOF
 
-  # Build env string
+  # Build env string — strip any "-e" flags (used by container mode)
   local -a env_args=(AGT_SANDBOX=1 "ZDOTDIR=$sandbox_zdotdir")
   for e in "${_agt_env[@]}"; do
+    [[ "$e" == "-e" ]] && continue
     env_args+=("$e")
   done
 
@@ -387,7 +444,7 @@ cmd_enter() {
 }
 
 cmd_list() {
-  container ls 2>/dev/null | grep -E "^(ID|agt-)" || echo "No agt containers running"
+  container ls --all 2>/dev/null | grep -E "^(ID|agt-)" || echo "No agt containers found"
 }
 
 cmd_stop() {
@@ -408,13 +465,12 @@ cmd_clean() {
   cname="$(container_name "$branch")"
 
   container stop "$cname" 2>/dev/null && yellow "Stopped container $cname"
+  container rm "$cname" 2>/dev/null && yellow "Removed container $cname"
 
   if [[ -d "$worktree_dir" ]]; then
     git -C "$root" worktree remove "$worktree_dir" --force
     green "Removed worktree at $worktree_dir"
   fi
-
-  git -C "$root" branch -D "$branch" 2>/dev/null && yellow "Deleted branch $branch"
 
   green "Cleaned up $branch"
 }

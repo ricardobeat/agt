@@ -30,7 +30,7 @@ RUN curl https://mise.run | sh \
 USER agt
 WORKDIR /home/agt
 
-# Bun via mise
+# Default tools via mise
 RUN mise use -g bun@latest
 
 # Claude CLI
@@ -42,8 +42,9 @@ COPY --chown=agt:agt claude.json /home/agt/.claude.json
 # Shell setup
 ENV SHELL=/bin/zsh
 RUN echo 'eval "$(mise activate zsh)"' >> /home/agt/.zshrc \
-    && echo 'eval "$(mise activate bash)"' >> /home/agt/.bashrc
-ENV PATH="/home/agt/.local/share/mise/shims:/home/agt/.local/bin:${PATH}"
+    && echo 'eval "$(mise activate bash)"' >> /home/agt/.bashrc \
+    && echo 'PROMPT="%F{yellow}[${AGT_NAME:-agt}]%f %F{blue}%~%f $ "' >> /home/agt/.zshrc
+ENV PATH="/cache/mise/shims:/home/agt/.local/share/mise/shims:/home/agt/.local/bin:${PATH}"
 
 WORKDIR /work
 CMD ["/bin/zsh"]
