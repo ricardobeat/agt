@@ -49,6 +49,24 @@ load_config() {
 
 load_config
 
+AGT_MODES_FILE="$HOME/.agt/modes.json"
+
+save_mode() {
+  local path="$1" mode="$2"
+  mkdir -p "$(dirname "$AGT_MODES_FILE")"
+  if [[ -f "$AGT_MODES_FILE" ]]; then
+    jq --arg p "$path" --arg m "$mode" '.[$p] = $m' "$AGT_MODES_FILE" > "$AGT_MODES_FILE.tmp" \
+      && mv "$AGT_MODES_FILE.tmp" "$AGT_MODES_FILE"
+  else
+    jq -n --arg p "$path" --arg m "$mode" '{($p): $m}' > "$AGT_MODES_FILE"
+  fi
+}
+
+recall_mode() {
+  local path="$1"
+  [[ -f "$AGT_MODES_FILE" ]] && jq -r --arg p "$path" '.[$p] // empty' "$AGT_MODES_FILE"
+}
+
 usage() {
   cat <<EOF
 agt — sandboxed AI agent development tool
@@ -168,7 +186,8 @@ $git_root_line
   (subpath "/private/var/folders")
   (subpath "$worktree")
 $git_dir_line
-  (subpath "$HOME/.agt"))
+  (subpath "$HOME/.agt")
+  (subpath "$HOME/.local"))
 
 ;; Network and sockets
 (allow network*)
@@ -233,15 +252,15 @@ setup_env() {
       git -C "$root" worktree add "$_agt_worktree" -b "$branch" 2>/dev/null \
         || git -C "$root" worktree add "$_agt_worktree" "$branch"
       green "Worktree created at $_agt_worktree"
-      # Persist the execution mode so subsequent commands remember it
-      echo "$AGT_MODE" > "$_agt_worktree/.agt-mode"
+      save_mode "$_agt_worktree" "$AGT_MODE"
     else
       yellow "Worktree already exists at $_agt_worktree"
-      # Recall the mode used when this worktree was created (explicit --mode overrides)
       if [[ -n "${_agt_mode_override:-}" ]]; then
-        echo "$AGT_MODE" > "$_agt_worktree/.agt-mode"
-      elif [[ -f "$_agt_worktree/.agt-mode" ]]; then
-        AGT_MODE="$(cat "$_agt_worktree/.agt-mode")"
+        save_mode "$_agt_worktree" "$AGT_MODE"
+      else
+        local saved_mode
+        saved_mode="$(recall_mode "$_agt_worktree")"
+        [[ -n "$saved_mode" ]] && AGT_MODE="$saved_mode"
       fi
     fi
 
@@ -261,9 +280,24 @@ setup_env() {
   local agt_config_dir="$HOME/.agt/claude-config"
   mkdir -p "$agt_config_dir"
 
+  # Shared agt Claude settings — initialized once, user can edit later
+  local agt_settings="$HOME/.agt/.claude/settings.json"
+  if [[ ! -f "$agt_settings" ]]; then
+    mkdir -p "$HOME/.agt/.claude"
+    if [[ -f "$HOME/.claude/settings.json" ]]; then
+      cp "$HOME/.claude/settings.json" "$agt_settings"
+      jq '. * {"sandbox": {"enabled": false}}' "$agt_settings" > "$agt_settings.tmp" \
+        && mv "$agt_settings.tmp" "$agt_settings"
+    else
+      echo '{"sandbox":{"enabled":false}}' > "$agt_settings"
+    fi
+    green "Created agt Claude settings at $agt_settings"
+  fi
+
   if [[ -d "$HOME/.claude" ]]; then
     rsync -a --delete \
       --exclude '.credentials.json' \
+      --exclude 'settings.json' \
       --exclude 'sessions' \
       --exclude 'history.jsonl' \
       --exclude 'todos' \
@@ -274,6 +308,7 @@ setup_env() {
   fi
 
   cp -f "$AGT_DIR/claude.json" "$agt_config_dir/.claude.json"
+  cp -f "$agt_settings" "$agt_config_dir/settings.json"
 
   if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
     _agt_env+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
