@@ -1,0 +1,12 @@
+{
+  "name": "agt",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "agt-js": "./agt.js"
+  },
+  "dependencies": {
+    "picocolors": "^1.1.1",
+    "smol-toml": "^1.6.1"
+  }
+}

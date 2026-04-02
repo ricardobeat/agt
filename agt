@@ -133,7 +133,8 @@ container_name() {
 
 generate_sandbox_profile() {
   local worktree="$1"
-  local git_root="${2:-}"
+  local real_home="$2"
+  local git_root="${3:-}"
   local git_root_line=""
   local git_dir_line=""
   if [[ -n "$git_root" ]]; then
@@ -156,7 +157,7 @@ generate_sandbox_profile() {
 (allow file-read-metadata)
 (allow file-read-xattr)
 
-;; File content reads: system paths + worktree + git root + specific home dirs only
+;; File content reads: system paths + worktree + git root + real home dotfiles
 (allow file-read-data
   (literal "/")
   (subpath "/Applications")
@@ -175,10 +176,11 @@ generate_sandbox_profile() {
   (subpath "/Volumes")
   (subpath "$worktree")
 $git_root_line
-  (regex #"^$HOME/\..*")
-  (subpath "$HOME/Library"))
+  (regex #"^$real_home/\..*")
+  (subpath "$real_home/Library"))
 
-;; Writes: worktree, git dir, agt config, temp, and dev only
+;; Writes: worktree, git dir, agt state, temp, and dev only
+;; HOME is redirected to sandbox home (under ~/.agt/), so all tool writes go there
 (allow file-write*
   (subpath "/dev")
   (subpath "/tmp")
@@ -186,13 +188,87 @@ $git_root_line
   (subpath "/private/var/folders")
   (subpath "$worktree")
 $git_dir_line
-  (subpath "$HOME/.agt")
-  (subpath "$HOME/.local"))
+  (subpath "$real_home/.agt"))
 
 ;; Network and sockets
 (allow network*)
 (allow system-socket)
 SBEOF
+}
+
+# Clone host dotfiles into sandbox home using APFS copy-on-write (cp -c).
+# Edit this list to add paths for tools you use.
+setup_sandbox_home() {
+  local sandbox_home="$1"
+  local real_home="$2"
+
+  mkdir -p "$sandbox_home"
+
+  # Paths relative to $HOME to clone into sandbox home.
+  # Directories are cloned recursively; missing paths are silently skipped.
+  local -a clone_paths=(
+    # Version managers / runtimes
+    .local/share/mise
+    .config/mise
+    .nvm
+    .volta
+    .rustup
+    .cargo
+    .pyenv
+    .rbenv
+    .gem
+    .goenv
+    .go
+    .deno
+    .bun
+
+    # Git
+    .gitconfig
+    .config/git
+
+    # SSH (for git over SSH)
+    .ssh
+
+    # Shell config
+    .zshrc
+    .zshenv
+    .zprofile
+    .bashrc
+    .bash_profile
+    .profile
+    .inputrc
+
+    # Package managers
+    .npmrc
+    .yarnrc.yml
+
+    # Tool config
+    .config/gh
+    .config/pip
+    .config/composer
+
+    # JVM
+    .gradle
+    .m2
+  )
+
+  for relpath in "${clone_paths[@]}"; do
+    local src="$real_home/$relpath"
+    [[ -e "$src" ]] || continue
+
+    local dest="$sandbox_home/$relpath"
+    mkdir -p "$(dirname "$dest")"
+
+    # APFS clone (instant, zero disk cost until modified); fall back to regular copy
+    cp -Rc "$src" "$dest" 2>/dev/null || cp -R "$src" "$dest"
+  done
+
+  # Docker config — just the auth file, not images/buildx state
+  if [[ -f "$real_home/.docker/config.json" ]]; then
+    mkdir -p "$sandbox_home/.docker"
+    cp -c "$real_home/.docker/config.json" "$sandbox_home/.docker/config.json" 2>/dev/null \
+      || cp "$real_home/.docker/config.json" "$sandbox_home/.docker/config.json"
+  fi
 }
 
 # Prepare worktree, mounts, auth, and image — sets shared variables
@@ -403,22 +479,37 @@ run_in_container() {
 }
 
 run_in_sandbox() {
+  local real_home="$HOME"
+  local branch_slug="${_agt_branch//\//-}"
+  local sandbox_home="$HOME/.agt/sandbox-state/$branch_slug/home"
+
+  # Clone host dotfiles into sandbox home (APFS CoW — instant, zero extra disk)
+  if [[ ! -d "$sandbox_home" ]]; then
+    bold "Setting up sandbox home..."
+    setup_sandbox_home "$sandbox_home" "$real_home"
+  fi
+
   local profile_file
   profile_file="$(mktemp /tmp/agt-sandbox.XXXXXX)"
-  generate_sandbox_profile "$_agt_worktree" "${_agt_git_root:-}" > "$profile_file"
+  generate_sandbox_profile "$_agt_worktree" "$real_home" "${_agt_git_root:-}" > "$profile_file"
 
   bold "Starting sandbox for $_agt_branch in $_agt_worktree..."
 
-  # Create a ZDOTDIR with a .zshrc that sources the user's and adds the prompt prefix
-  local sandbox_zdotdir
-  sandbox_zdotdir="$(mktemp -d /tmp/agt-sandbox-zd.XXXXXX)"
-  cat > "$sandbox_zdotdir/.zshrc" <<'RCEOF'
-[[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc"
-PROMPT="%F{yellow}[sandbox]%f $PROMPT"
+  # ZDOTDIR inside sandbox home — sources the cloned .zshrc and adds prompt prefix
+  local sandbox_zdotdir="$sandbox_home/.agt-zd"
+  mkdir -p "$sandbox_zdotdir"
+  cat > "$sandbox_zdotdir/.zshrc" <<RCEOF
+[[ -f "$sandbox_home/.zshrc" ]] && source "$sandbox_home/.zshrc"
+PROMPT="%F{yellow}[sandbox]%f \$PROMPT"
 RCEOF
 
   # Build env string — strip any "-e" flags (used by container mode)
-  local -a env_args=(AGT_SANDBOX=1 "ZDOTDIR=$sandbox_zdotdir")
+  local -a env_args=(
+    AGT_SANDBOX=1
+    "HOME=$sandbox_home"
+    "ZDOTDIR=$sandbox_zdotdir"
+    "HISTFILE=$sandbox_home/.zsh_history"
+  )
   for e in "${_agt_env[@]}"; do
     [[ "$e" == "-e" ]] && continue
     env_args+=("$e")
@@ -428,7 +519,7 @@ RCEOF
     /usr/bin/env "${env_args[@]}" \
     /bin/zsh -c "cd '$_agt_worktree' && exec \"\$@\"" -- "$@"
 
-  rm -rf "$sandbox_zdotdir" "$profile_file"
+  rm -f "$profile_file"
 }
 
 run_agt() {
@@ -505,6 +596,13 @@ cmd_clean() {
   if [[ -d "$worktree_dir" ]]; then
     git -C "$root" worktree remove "$worktree_dir" --force
     green "Removed worktree at $worktree_dir"
+  fi
+
+  local branch_slug="${branch//\//-}"
+  local sandbox_state="$HOME/.agt/sandbox-state/$branch_slug"
+  if [[ -d "$sandbox_state" ]]; then
+    rm -rf "$sandbox_state"
+    yellow "Removed sandbox state at $sandbox_state"
   fi
 
   green "Cleaned up $branch"
