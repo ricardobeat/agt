@@ -1,6 +1,8 @@
 // Sandbox profile template and rendering.
 
-import { HOME } from "./shared.js";
+import { homedir } from "node:os";
+
+const HOME = homedir();
 
 const TEMPLATE = `(version 1)
 (deny default)
@@ -50,18 +52,19 @@ const TEMPLATE = `(version 1)
 `;
 
 export function renderSandboxProfile(worktree, gitRoot) {
-  let out = TEMPLATE
-    .replace(/\{\{worktree\}\}/g, worktree)
-    .replace(/\{\{home\}\}/g, HOME);
+	let out = TEMPLATE.replace(/\{\{worktree\}\}/g, worktree).replace(
+		/\{\{home\}\}/g,
+		HOME,
+	);
 
-  if (gitRoot) {
-    out = out
-      .replace(/\{\{#gitRoot\}\}\n?/g, "")
-      .replace(/\{\{\/gitRoot\}\}\n?/g, "")
-      .replace(/\{\{gitRoot\}\}/g, gitRoot);
-  } else {
-    out = out.replace(/\{\{#gitRoot\}\}[\s\S]*?\{\{\/gitRoot\}\}\n?/g, "");
-  }
+	if (gitRoot) {
+		out = out
+			.replace(/\{\{#gitRoot\}\}\n?/g, "")
+			.replace(/\{\{\/gitRoot\}\}\n?/g, "")
+			.replace(/\{\{gitRoot\}\}/g, gitRoot);
+	} else {
+		out = out.replace(/\{\{#gitRoot\}\}[\s\S]*?\{\{\/gitRoot\}\}\n?/g, "");
+	}
 
-  return out;
+	return out;
 }

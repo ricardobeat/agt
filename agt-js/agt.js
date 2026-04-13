@@ -1,224 +1,395 @@
-// The Agt class — setup pipeline, worktree management, and execution dispatch.
+#!/usr/bin/env bun
 
-import { existsSync, mkdirSync, writeFileSync, copyFileSync, readdirSync } from "fs";
-import { join, dirname, basename } from "path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import pc from "picocolors";
-import { $ } from "bun";
+import { parse as parseToml } from "smol-toml";
 
-import { HOME, AGT_DIR, DEFAULT_IMAGE, fatal, gitRoot, readJson, writeJson, loadToml } from "./shared.js";
-import { renderSandboxProfile } from "./sandbox.js";
+const HOME = homedir();
+const _AGT_DIR = dirname(dirname(new URL(import.meta.url).pathname));
+const DEFAULT_IMAGE = "agt-sandbox";
+function fatal(msg) {
+	console.error(pc.red(msg));
+	process.exit(1);
+}
+
+import { promptBranchName } from "./lib/cli.js";
 import {
-  containerName, resolveImage,
-  ensureImage, ensureContainer, execContainer,
-  setupMounts, buildImage, listContainers, stopContainer, cleanContainer,
-} from "./container.js";
-
-export { DEFAULT_IMAGE, resolveImage };
+	baseDockerfile,
+	branchImageName,
+	buildImage,
+	checkImageFresh,
+	cleanContainer,
+	containerName,
+	listContainers,
+	projectDockerfile,
+	projectImageName,
+	runContainer,
+	setupMounts,
+} from "./lib/container.js";
+import {
+	createWorktree,
+	gitRoot,
+	hasGitHistory,
+	removeWorktree,
+	worktreePath,
+} from "./lib/git.js";
+import { renderSandboxProfile } from "./lib/sandbox.js";
 
 const MODES_FILE = join(HOME, ".agt", "modes.json");
 
-// --- class ---
+// --- CLI ---
 
-export default class Agt {
-  mode = "container";
-  image = DEFAULT_IMAGE;
-  envVars = {};
-  mounts = [];
+const COMMANDS = {
+	start: { min: 0, usage: "agt start [branch] [prompt...]" },
+	enter: { min: 0, usage: "agt enter [branch]" },
+	build: { min: 0, usage: "agt build [--image tag] <dockerfile>" },
+	list: { min: 0 },
+	ls: { min: 0 },
+	rm: { min: 1, usage: "agt rm <branch>" },
+};
 
-  constructor() {
-    const file = ["./agt.toml", join(HOME, ".config", "agt", "config.toml")].find(existsSync);
-    if (file) this.mode = loadToml(file)?.execution?.mode ?? this.mode;
-  }
+function usage() {
+	console.log(`agt — sandboxed AI agent development tool
 
-  // --- setup pipeline ---
+Usage:
+  agt start [branch] [prompt...]   Create worktree + sandbox, run agent inside
+  agt enter [branch]               Create worktree + sandbox, drop into a shell
+  agt build [dockerfile]           Build container image (container mode only)
+  agt list                         List running agt containers
+  agt rm <branch>                  Remove worktree and container
 
-  async setup(args) {
-    args = [...args];
-    let modeOverride = false;
+Options:
+  --image <name>                   Use a custom image (container mode, skips auto-build)
+  --mode <container|sandbox>       Override execution mode
 
-    while (args[0]?.startsWith("--")) {
-      const flag = args.shift();
-      if (flag === "--image") this.image = args.shift();
-      else if (flag === "--mode") {
-        this.mode = args.shift();
-        modeOverride = true;
-      }
-    }
-    if (!args.length) fatal("branch name required");
+Execution modes (set via agt.toml):
+  container                        Run inside an Apple container (default)
+  sandbox                          Run via sandbox-exec (macOS seatbelt)
 
-    this.branch = args.shift();
-    this.remainingArgs = args;
-    this.cname = containerName(this.branch);
-    this.envVars.AGT_NAME = this.cname;
+Config file (agt.toml) is loaded from ./agt.toml or ~/.config/agt/config.toml:
+  [container]
+  mode = "sandbox"          # or "container" (default)
+  entrypoint = "claude"     # command to run inside the container
+  cpus = 2                  # number of CPUs (default: 2)
+  memory = "4G"             # memory limit (default: 4G)
+  init-image = "my-image"   # base image (skips Dockerfile.agt)
+  dns-domain = "local"      # default DNS domain
+  volumes = ["/host/path:/container/path"]
+  publish = ["8080:80"]     # host:container port mappings
+  read-only = false         # mount root filesystem read-only
 
-    if (this.mode === "container") await ensureImage(this.image);
-    await this.setupWorktree(modeOverride);
-    await this.setupClaudeConfig();
-    await this.setupAuth();
+  [worktree]
+  clone = [".secrets"]      # extra paths to clone into worktrees
 
-    if (this.mode === "container") {
-      const m = setupMounts(this.configDir);
-      this.mounts = m.mounts;
-      Object.assign(this.envVars, m.envVars);
-    } else {
-      this.envVars.CLAUDE_CONFIG_DIR = this.configDir;
-    }
-  }
+Examples:
+  agt start my-feature
+  agt enter my-feature
+  agt start my-feature --image my-custom-image
+  agt build ./Dockerfile
+  agt build --image my-tag ./path/to/Dockerfile
+`);
+	process.exit(1);
+}
 
-  async run(cmd) {
-    if (this.mode === "sandbox") this.execSandbox(cmd);
-    else {
-      await ensureContainer(this);
-      execContainer(cmd, this);
-    }
-  }
+const [cmd, ...rest] = process.argv.slice(2);
+if (!cmd) usage();
 
-  // --- setup steps ---
+const spec = COMMANDS[cmd];
+if (!spec) {
+	console.error(pc.red(`Unknown command: ${cmd}`));
+	usage();
+}
+if (spec.min && rest.length < spec.min) fatal(`Usage: ${spec.usage}`);
 
-  async setupWorktree(modeOverride) {
-    const root = await gitRoot();
-    if (!root) {
-      this.worktree = process.cwd();
-      this.gitRootPath = this.gitDir = null;
-      console.log(pc.bold("Using current directory as workspace"));
-      return;
-    }
+process.on("unhandledRejection", (err) => fatal(err?.message ?? String(err)));
 
-    this.worktree = join(root, ".worktrees", this.branch);
-    this.gitRootPath = root;
-    this.gitDir = join(root, ".git");
+switch (cmd) {
+	case "start":
+		await cmdStart(rest);
+		break;
+	case "enter":
+		await cmdEnter(rest);
+		break;
+	case "list":
+	case "ls": {
+		const root = (await gitRoot()) ?? process.cwd();
+		const containers = await listContainers(projectImageName(root));
+		if (!containers.length) {
+			console.log("No agt containers found");
+			break;
+		}
+		for (const c of containers) {
+			const state = c.state === "running" ? pc.green(c.state) : pc.dim(c.state);
+			const branch = pc.bold(c.branch);
+			const info = [state, `${c.cpus} cpus`, c.memory];
+			if (c.started) info.push(c.started);
+			console.log(`  ${branch}  ${info.join("  ")}`);
+		}
+		break;
+	}
+	case "rm":
+		await cmdClean(rest[0]);
+		break;
+	case "build": {
+		const args = [...rest];
+		let tag = null,
+			file = null;
+		while (args.length) {
+			const a = args.shift();
+			if (a === "--image") tag = args.shift();
+			else file = a;
+		}
+		file ??= baseDockerfile();
+		tag ??= DEFAULT_IMAGE;
+		if (!file) fatal(`Usage: ${spec.usage}`);
+		const { hash } = await checkImageFresh(tag, [file]);
+		console.log(pc.bold(`Building ${tag} from ${file}...`));
+		await buildImage(tag, file, hash);
+		console.log(pc.green(`Image ${tag} built successfully`));
+		break;
+	}
+}
 
-    if (existsSync(this.worktree)) {
-      console.log(pc.yellow(`Worktree already exists at ${this.worktree}`));
-      if (modeOverride) writeJson(MODES_FILE, { ...readJson(MODES_FILE), [this.worktree]: this.mode });
-      else this.mode = readJson(MODES_FILE)[this.worktree] ?? this.mode;
-    } else {
-      console.log(pc.bold(`Creating worktree for branch '${this.branch}'...`));
-      const r = await $`git -C ${root} worktree add ${this.worktree} -b ${this.branch}`.nothrow().quiet();
-      if (r.exitCode !== 0) {
-        const r2 = await $`git -C ${root} worktree add ${this.worktree} ${this.branch}`.nothrow();
-        if (r2.exitCode !== 0) fatal(`Command failed: git worktree add`);
-      }
-      console.log(pc.green(`Worktree created at ${this.worktree}`));
-      writeJson(MODES_FILE, { ...readJson(MODES_FILE), [this.worktree]: this.mode });
-    }
+// --- setup pipeline ---
 
-    // copy .env files
-    const r = await $`git -C ${root} ls-files --others --ignored --exclude-standard`.nothrow().quiet();
-    if (r.exitCode !== 0) return;
-    for (const rel of r.text().trim().split("\n").filter((l) => l.includes(".env"))) {
-      try {
-        const dest = join(this.worktree, dirname(rel));
-        mkdirSync(dest, { recursive: true });
-        copyFileSync(join(root, rel), join(dest, basename(rel)));
-      } catch {}
-    }
-  }
+async function setup(args) {
+	args = [...args];
+	let modeOverride = false;
 
-  get settingsPath() {
-    return join(HOME, ".agt", ".claude", "settings.json");
-  }
+	const ctx = {
+		mode: "container",
+		projectImage: DEFAULT_IMAGE,
+		imageOverride: false,
+		envVars: {},
+		mounts: [],
+		containerFlags: [],
+	};
 
-  async setupClaudeConfig() {
-    this.configDir = join(HOME, ".agt", "claude-config");
-    mkdirSync(this.configDir, { recursive: true });
+	const file = ["./agt.toml", join(HOME, ".config", "agt", "config.toml")].find(
+		existsSync,
+	);
+	if (file)
+		try {
+			const toml = parseToml(readFileSync(file, "utf8"));
+			const container = toml?.container ?? {};
 
-    // init shared settings once
-    if (!existsSync(this.settingsPath)) {
-      mkdirSync(dirname(this.settingsPath), { recursive: true });
-      const host = join(HOME, ".claude", "settings.json");
-      const settings = existsSync(host) ? readJson(host) : {};
-      settings.sandbox = { ...settings.sandbox, enabled: false };
-      writeJson(this.settingsPath, settings);
-      console.log(pc.green(`Created agt Claude settings at ${this.settingsPath}`));
-    }
+			ctx.mode = container.mode ?? ctx.mode;
+			ctx.entrypoint = container.entrypoint;
+			if (container.cpus) ctx.cpus = String(container.cpus);
+			if (container.memory) ctx.memory = String(container.memory);
+			if (container["init-image"]) ctx.projectImage = container["init-image"];
+			if (container["read-only"]) ctx.containerFlags.push("--read-only");
+			if (container["dns-domain"])
+				ctx.containerFlags.push("--dns-domain", container["dns-domain"]);
+			for (const v of [].concat(container.volumes ?? []))
+				ctx.containerFlags.push("-v", v);
+			for (const p of [].concat(container.publish ?? []))
+				ctx.containerFlags.push("--publish", p);
 
-    // rsync host claude config (excluding ephemeral/sensitive data)
-    if (existsSync(join(HOME, ".claude"))) {
-      const excludes = [
-        ".credentials.json", "settings.json", "sessions",
-        "history.jsonl", "todos", "statsig", "telemetry", "cache",
-      ];
-      const args = ["rsync", "-a", "--delete",
-        ...excludes.flatMap((e) => ["--exclude", e]),
-        join(HOME, ".claude") + "/", this.configDir + "/"];
-      try { await $`${args}`; }
-      catch { fatal(`rsync failed`); }
-    }
+			ctx.clonePaths = toml?.worktree?.clone ?? [];
+		} catch {}
 
-    try { copyFileSync(join(AGT_DIR, "claude.json"), join(this.configDir, ".claude.json")); } catch {}
-    try { copyFileSync(this.settingsPath, join(this.configDir, "settings.json")); } catch {}
-  }
+	while (args[0]?.startsWith("--")) {
+		const flag = args.shift();
+		if (flag === "--image") {
+			ctx.projectImage = args.shift();
+			ctx.imageOverride = true;
+		} else if (flag === "--mode") {
+			ctx.mode = args.shift();
+			modeOverride = true;
+		}
+	}
+	if (!args.length || !args[0] || args[0].startsWith("--")) {
+		ctx.branch = await promptBranchName();
+	} else {
+		ctx.branch = args.shift();
+	}
+	ctx.remainingArgs = args;
+	ctx.cname = containerName(ctx.branch);
+	ctx.envVars.AGT_NAME = ctx.cname;
 
-  async setupAuth() {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (apiKey) {
-      this.envVars.ANTHROPIC_API_KEY = apiKey;
-      return;
-    }
-    const r = await $`security find-generic-password -s ${"Claude Code-credentials"} -w`.nothrow().quiet();
-    if (r.exitCode === 0 && r.text().trim()) {
-      writeFileSync(join(this.configDir, ".credentials.json"), r.text().trim(), { mode: 0o600 });
-    } else {
-      console.log(pc.yellow("Warning: no API key or OAuth token found. Run 'claude' on the host to authenticate first."));
-    }
-  }
+	if (ctx.mode === "container") {
+		const root = await gitRoot();
 
-  // --- sandbox execution ---
+		// Ensure base image is up to date
+		const baseDf = baseDockerfile();
+		if (baseDf) {
+			const { needsBuild, hash } = await checkImageFresh(DEFAULT_IMAGE, [
+				baseDf,
+			]);
+			if (needsBuild) {
+				console.log(pc.yellow(`Building base image from ${baseDf}...`));
+				await buildImage(DEFAULT_IMAGE, baseDf, hash);
+				console.log(pc.green("Base image built successfully"));
+			}
+		}
 
-  execSandbox(cmd) {
-    const profileFile = `/tmp/agt-sandbox.${process.pid}.sb`;
-    writeFileSync(profileFile, renderSandboxProfile(this.worktree, this.gitRootPath));
+		// Resolve project image
+		if (!ctx.imageOverride) {
+			ctx.projectImage = projectImageName(root ?? process.cwd());
+		}
+		const projectDf = await projectDockerfile();
+		if (projectDf) {
+			const configFiles = [projectDf, file].filter(Boolean);
+			const { needsBuild, hash, stateWillBeLost } = await checkImageFresh(
+				ctx.projectImage,
+				configFiles,
+			);
+			if (needsBuild) {
+				if (stateWillBeLost) {
+					console.log(
+						pc.yellow(
+							"Warning: Dockerfile changed — rebuilding image. All container state will be lost.",
+						),
+					);
+				}
+				console.log(pc.yellow(`Building image from ${projectDf}...`));
+				await buildImage(ctx.projectImage, projectDf, hash);
+				console.log(pc.green(`Image ${ctx.projectImage} built successfully`));
+			}
+		} else if (!ctx.imageOverride) {
+			// No project Dockerfile — use the base image directly
+			ctx.projectImage = DEFAULT_IMAGE;
+		}
 
-    console.log(pc.bold(`Starting sandbox for ${this.branch} in ${this.worktree}...`));
+		ctx.branchImage = branchImageName(root ?? process.cwd(), ctx.branch);
+	}
 
-    const zdotdir = `/tmp/agt-sandbox-zd.${process.pid}`;
-    mkdirSync(zdotdir, { recursive: true });
-    writeFileSync(join(zdotdir, ".zshrc"),
-      `[[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc"\nPROMPT="%F{yellow}[sandbox]%f $PROMPT"\n`);
+	await setupWorktree(ctx, modeOverride);
 
-    const envArgs = Object.entries(this.envVars).map(([k, v]) => `${k}=${v}`);
-    const args = ["sandbox-exec", "-f", profileFile,
-      "/usr/bin/env", "AGT_SANDBOX=1", `ZDOTDIR=${zdotdir}`, ...envArgs,
-      "/bin/zsh", "-c", `cd '${this.worktree}' && exec "$@"`, "--", ...cmd];
-    const { exitCode } = Bun.spawnSync(args, { stdio: ["inherit", "inherit", "inherit"] });
-    process.exit(exitCode);
-  }
+	if (ctx.mode === "container") {
+		const m = setupMounts(`${ctx.projectImage}-${ctx.branch}`);
+		ctx.mounts = m.mounts;
+		Object.assign(ctx.envVars, m.envVars);
+	}
 
-  // --- commands ---
+	return ctx;
+}
 
-  async cmdStart(args) {
-    await this.setup(args);
-    const claudeArgs = [
-      "claude", "--dangerously-skip-permissions",
-      "--channels", "plugin:telegram@claude-plugins-official",
-    ];
+async function run(ctx, cmd) {
+	if (ctx.mode === "sandbox") execSandbox(ctx, cmd);
+	else {
+		console.log(pc.bold(`Starting container ${ctx.cname}...`));
+		await runContainer({ ...ctx, cmd });
+	}
+}
 
-    const sessionsDir = join(this.configDir, "sessions");
-    if (existsSync(join(this.configDir, "projects")) && existsSync(sessionsDir)
-      && readdirSync(sessionsDir).some((e) => e.endsWith(".json")))
-      claudeArgs.push("--continue");
+// --- setup steps ---
 
-    if (this.remainingArgs.length) claudeArgs.push("-p", this.remainingArgs.join(" "));
-    await this.run(claudeArgs);
-  }
+async function setupWorktree(ctx, modeOverride) {
+	const root = await gitRoot();
+	if (!root || !(await hasGitHistory(root))) {
+		ctx.worktree = process.cwd();
+		ctx.gitRootPath = ctx.gitDir = null;
+		console.log(pc.bold("Using current directory as workspace"));
+		return;
+	}
 
-  async cmdEnter(args) {
-    await this.setup(args);
-    await this.run(["zsh"]);
-  }
+	ctx.gitRootPath = root;
+	ctx.gitDir = join(root, ".git");
 
-  async cmdClean(branch) {
-    const root = (await gitRoot()) || fatal("Not inside a git repository");
-    const wt = join(root, ".worktrees", branch);
+	let result;
+	try {
+		result = await createWorktree(root, ctx.branch, ctx.clonePaths);
+	} catch (e) {
+		fatal(e.message);
+	}
 
-    await cleanContainer(branch);
+	ctx.worktree = result.path;
 
-    if (existsSync(wt)) {
-      try { await $`git -C ${root} worktree remove ${wt} --force`; }
-      catch { fatal(`git worktree remove failed`); }
-      console.log(pc.green(`Removed worktree at ${wt}`));
-    }
-    console.log(pc.green(`Cleaned up ${branch}`));
-  }
+	const modes = (() => {
+		try {
+			return JSON.parse(readFileSync(MODES_FILE, "utf8"));
+		} catch {
+			return {};
+		}
+	})();
+	if (result.existed) {
+		console.log(pc.yellow(`Worktree already exists at ${ctx.worktree}`));
+		if (modeOverride)
+			writeFileSync(
+				MODES_FILE,
+				JSON.stringify({ ...modes, [ctx.worktree]: ctx.mode }, null, 2),
+			);
+		else ctx.mode = modes[ctx.worktree] ?? ctx.mode;
+	} else {
+		console.log(pc.green(`Worktree created at ${ctx.worktree}`));
+		mkdirSync(dirname(MODES_FILE), { recursive: true });
+		writeFileSync(
+			MODES_FILE,
+			JSON.stringify({ ...modes, [ctx.worktree]: ctx.mode }, null, 2),
+		);
+	}
+}
+
+// --- sandbox execution ---
+
+function execSandbox(ctx, cmd) {
+	const profileFile = `/tmp/agt-sandbox.${process.pid}.sb`;
+	writeFileSync(
+		profileFile,
+		renderSandboxProfile(ctx.worktree, ctx.gitRootPath),
+	);
+
+	console.log(
+		pc.bold(`Starting sandbox for ${ctx.branch} in ${ctx.worktree}...`),
+	);
+
+	const zdotdir = `/tmp/agt-sandbox-zd.${process.pid}`;
+	mkdirSync(zdotdir, { recursive: true });
+	writeFileSync(
+		join(zdotdir, ".zshrc"),
+		`[[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc"\nPROMPT="%F{yellow}[sandbox]%f $PROMPT"\n`,
+	);
+
+	const envArgs = Object.entries(ctx.envVars).map(([k, v]) => `${k}=${v}`);
+	const args = [
+		"sandbox-exec",
+		"-f",
+		profileFile,
+		"/usr/bin/env",
+		"AGT_SANDBOX=1",
+		`ZDOTDIR=${zdotdir}`,
+		...envArgs,
+		"/bin/zsh",
+		"-c",
+		`cd '${ctx.worktree}' && exec "$@"`,
+		"--",
+		...cmd,
+	];
+	const { exitCode } = Bun.spawnSync(args, {
+		stdio: ["inherit", "inherit", "inherit"],
+	});
+	process.exit(exitCode);
+}
+
+// --- commands ---
+
+async function cmdStart(args) {
+	const ctx = await setup(args);
+	const entry = ctx.entrypoint ?? "claude";
+	const agentCmd =
+		entry === "claude" ? ["claude", "--dangerously-skip-permissions"] : [entry];
+	if (ctx.remainingArgs.length)
+		agentCmd.push("-p", ctx.remainingArgs.join(" "));
+	await run(ctx, agentCmd);
+}
+
+async function cmdEnter(args) {
+	const ctx = await setup(args);
+	await run(ctx, ["/bin/bash"]);
+}
+
+async function cmdClean(branch) {
+	const root = (await gitRoot()) || fatal("Not inside a git repository");
+	await cleanContainer(branch, branchImageName(root, branch));
+	try {
+		await removeWorktree(root, branch);
+	} catch (e) {
+		fatal(e.message);
+	}
+	console.log(pc.green(`Removed worktree at ${worktreePath(root, branch)}`));
+	console.log(pc.green(`Cleaned up ${branch}`));
 }
