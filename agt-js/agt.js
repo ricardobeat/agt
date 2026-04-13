@@ -176,7 +176,7 @@ async function setup(args) {
 			const container = toml?.container ?? {};
 
 			ctx.mode = container.mode ?? ctx.mode;
-			ctx.entrypoint = container.entrypoint;
+			ctx.entrypoint = container.entrypoint ?? container.agent;
 			if (container.cpus) ctx.cpus = String(container.cpus);
 			if (container.memory) ctx.memory = String(container.memory);
 			if (container["init-image"]) ctx.projectImage = container["init-image"];
