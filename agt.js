@@ -142,6 +142,7 @@ class Agt {
       const flag = args.shift();
       if (flag === "--image") this.image = args.shift();
       else if (flag === "--mode") { this.mode = args.shift(); modeOverride = true; }
+      else if (flag === "--run") this.runCmd = args.shift();
     }
 
     if (!args.length) fatal("branch name required");
@@ -345,15 +346,15 @@ class Agt {
 
   async cmdStart(args) {
     await this.setup(args);
-    const claudeArgs = ["claude", "--dangerously-skip-permissions", "--channels", "plugin:telegram@claude-plugins-official"];
+    const cmdToRun = this.runCmd ? this.runCmd.split(/\s+/).filter(Boolean) : ["claude", "--dangerously-skip-permissions", "--channels", "plugin:telegram@claude-plugins-official"];
 
     const sessionsDir = join(this.configDir, "sessions");
-    if (existsSync(join(this.configDir, "projects")) && existsSync(sessionsDir)
+    if (!this.runCmd && existsSync(join(this.configDir, "projects")) && existsSync(sessionsDir)
       && readdirSync(sessionsDir).some((e) => e.endsWith(".json")))
-      claudeArgs.push("--continue");
+      cmdToRun.push("--continue");
 
-    if (this.remainingArgs.length) claudeArgs.push("-p", this.remainingArgs.join(" "));
-    await this.run(claudeArgs);
+    if (this.remainingArgs.length) cmdToRun.push("-p", this.remainingArgs.join(" "));
+    await this.run(cmdToRun);
   }
 
   async cmdEnter(args) { await this.setup(args); await this.run(["zsh"]); }
@@ -408,6 +409,7 @@ Usage:
 Options:
   --image <name>                   Use a custom image (container mode, skips auto-build)
   --mode <container|sandbox>       Override execution mode
+  --run <command>                  Run a custom command instead of claude
 
 Execution modes (set via agt.toml):
   container                        Run inside an Apple container (default)
@@ -421,6 +423,7 @@ Examples:
   agt start my-feature
   agt enter my-feature
   agt start my-feature --image my-custom-image
+  agt start my-feature --run codex
   agt build ./Dockerfile
   agt build --image my-tag ./path/to/Dockerfile
 `);
