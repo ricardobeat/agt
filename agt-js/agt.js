@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import pc from "picocolors";
@@ -15,6 +15,7 @@ function fatal(msg) {
 }
 
 import { promptBranchName } from "./lib/cli.js";
+import { debug, enableDebug } from "./lib/debug.js";
 import {
 	baseDockerfile,
 	branchImageName,
@@ -199,6 +200,8 @@ async function setup(args) {
 		} else if (flag === "--mode") {
 			ctx.mode = args.shift();
 			modeOverride = true;
+		} else if (flag === "--debug") {
+			enableDebug();
 		}
 	}
 	if (!args.length || !args[0] || args[0].startsWith("--")) {
@@ -221,7 +224,9 @@ async function setup(args) {
 			]);
 			if (needsBuild) {
 				console.log(pc.yellow(`Building base image from ${baseDf}...`));
+				debug(`buildImage ${DEFAULT_IMAGE}`);
 				await buildImage(DEFAULT_IMAGE, baseDf, hash);
+				debug(`buildImage ${DEFAULT_IMAGE} done`);
 				console.log(pc.green("Base image built successfully"));
 			}
 		}
@@ -257,10 +262,14 @@ async function setup(args) {
 		ctx.branchImage = branchImageName(root ?? process.cwd(), ctx.branch);
 	}
 
+	debug(`setupWorktree ${ctx.branch}`);
 	await setupWorktree(ctx, modeOverride);
+	debug(`setupWorktree done`);
 
 	if (ctx.mode === "container") {
+		debug(`setupMounts ${ctx.projectImage}-${ctx.branch}`);
 		const m = setupMounts(`${ctx.projectImage}-${ctx.branch}`);
+		debug(`setupMounts done`);
 		ctx.mounts = m.mounts;
 		Object.assign(ctx.envVars, m.envVars);
 	}
@@ -390,6 +399,8 @@ async function cmdClean(branch) {
 	} catch (e) {
 		fatal(e.message);
 	}
+	const homeDir = join(HOME, ".agt", "home", `${projectImageName(root)}-${branch}`);
+	if (existsSync(homeDir)) rmSync(homeDir, { recursive: true });
 	console.log(pc.green(`Removed worktree at ${worktreePath(root, branch)}`));
 	console.log(pc.green(`Cleaned up ${branch}`));
 }

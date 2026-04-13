@@ -1,13 +1,24 @@
 // Container lifecycle — image builds, container management, and execution.
 
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { $ } from "bun";
 
+import { parse as parseToml } from "smol-toml";
+
 import { colorizeBuildLine } from "./cli.js";
+import { debug } from "./debug.js";
 import { gitRoot } from "./git.js";
+
+function loadDefaults() {
+	try {
+		return parseToml(readFileSync(join(AGT_DIR, "defaults.toml"), "utf8"));
+	} catch {
+		return {};
+	}
+}
 
 const HOME = homedir();
 const AGT_DIR = dirname(dirname(new URL(import.meta.url).pathname));
@@ -145,27 +156,46 @@ export function setupMounts(containerKey) {
 		mounts.push([dir, `/cache/${sub}`]);
 	}
 
-	// Claude config
-	const claudeDir = join(HOME, ".claude");
-	if (existsSync(claudeDir)) {
-		mounts.push([claudeDir, "/home/agt/.claude", "ro"]);
-	}
-
-	// pi credentials — COW copy per branch so it's writable but host is untouched
-	const hostPi = join(HOME, ".pi");
-	if (existsSync(hostPi)) {
-		const branchPi = join(HOME, ".agt", "home", containerKey, ".pi");
-		if (!existsSync(branchPi)) {
-			mkdirSync(dirname(branchPi), { recursive: true });
-			Bun.spawnSync(["cp", "-c", "-R", hostPi, branchPi]);
+	// COW mounts: claude, pi — config drives which files are copied, always refreshed from host
+	const defaults = loadDefaults();
+	for (const name of ["claude", "pi"]) {
+		const hostDir = join(HOME, `.${name}`);
+		if (!existsSync(hostDir)) continue;
+		const branchDir = join(HOME, ".agt", "home", containerKey, `.${name}`);
+		mkdirSync(branchDir, { recursive: true });
+		const files = defaults?.[name]?.files;
+		if (files) {
+			for (const f of files) {
+				const src = join(hostDir, f);
+				const dst = join(branchDir, f);
+				if (existsSync(src)) {
+					const isDir = statSync(src).isDirectory();
+					mkdirSync(isDir ? dst : dirname(dst), { recursive: true });
+					debug(`rsync .${name}/${f}`);
+					Bun.spawnSync(["rsync", "-a", "--delete", isDir ? src + "/" : src, dst]);
+				}
+			}
+		} else {
+			debug(`cp .${name}/`);
+			Bun.spawnSync(["cp", "-c", "-R", hostDir + "/.", branchDir]);
 		}
-		mounts.push([branchPi, "/home/agt/.pi"]);
+		mounts.push([branchDir, `/home/agt/.${name}`]);
 	}
 
-	// Git config
-	const gitconfig = join(HOME, ".gitconfig");
-	if (existsSync(gitconfig)) {
-		mounts.push([gitconfig, "/home/agt/.gitconfig", "ro"]);
+	// Home dotfiles — copied fresh each run, mounted individually
+	const homeFiles = defaults?.home?.files ?? [];
+	if (homeFiles.length) {
+		const branchHomeDir = join(HOME, ".agt", "home", containerKey);
+		mkdirSync(branchHomeDir, { recursive: true });
+		for (const name of homeFiles) {
+			const src = join(HOME, name);
+			if (!existsSync(src)) continue;
+			const dst = join(branchHomeDir, name);
+			debug(`cp ${name}`);
+			Bun.spawnSync(["cp", src, dst]);
+			chmodSync(dst, 0o644);
+			mounts.push([dst, `/home/agt/${name}`]);
+		}
 	}
 
 	Object.assign(envVars, {
@@ -235,11 +265,24 @@ export async function runContainer({
 		runArgs.push("-v", mode ? `${src}:${dst}:${mode}` : `${src}:${dst}`);
 	}
 	runArgs.push(...containerFlags);
-	runArgs.push(...envFlags(envVars), "-w", "/work", image, ...cmd);
+	// Wrap relative commands in bash so the container's PATH (e.g. mise shims) is searched.
+	const finalCmd = cmd[0].startsWith("/")
+		? cmd
+		: ["/bin/bash", "--login", "-c", 'exec "$@"', "--", ...cmd];
+	runArgs.push(...envFlags(envVars), "-w", "/work", image, ...finalCmd);
 
-	const { exitCode } = Bun.spawnSync(runArgs, {
+	const proc = Bun.spawn(runArgs, {
 		stdio: ["inherit", "inherit", "inherit"],
 	});
+
+	const cleanup = async (signal) => {
+		await $`container rm -f ${cname}`.nothrow().quiet();
+		process.exit(signal === "SIGINT" ? 130 : 143);
+	};
+	process.once("SIGINT", () => cleanup("SIGINT"));
+	process.once("SIGTERM", () => cleanup("SIGTERM"));
+
+	const exitCode = await proc.exited;
 
 	// Commit container state to branch-specific image
 	await $`container commit ${cname} ${branchImage}`.nothrow().quiet();
