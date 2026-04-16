@@ -189,6 +189,7 @@ async function setup(args) {
 				ctx.containerFlags.push("--publish", p);
 
 			ctx.clonePaths = toml?.worktree?.clone ?? [];
+			ctx.miseTools = toml?.mise?.tools ?? {};
 		} catch {}
 
 	while (args[0]?.startsWith("--")) {
@@ -245,7 +246,7 @@ async function setup(args) {
 				if (stateWillBeLost) {
 					console.log(
 						pc.yellow(
-							"Warning: Dockerfile changed — rebuilding image. All container state will be lost.",
+							"Warning: Dockerfile changed — rebuilding image. Installed apt packages will be reset (mise tools are preserved).",
 						),
 					);
 				}
@@ -266,7 +267,7 @@ async function setup(args) {
 
 	if (ctx.mode === "container") {
 		debug(`setupMounts ${ctx.projectImage}-${ctx.branch}`);
-		const m = setupMounts(`${ctx.projectImage}-${ctx.branch}`);
+		const m = setupMounts(`${ctx.projectImage}-${ctx.branch}`, ctx.miseTools ?? {});
 		debug(`setupMounts done`);
 		ctx.mounts = m.mounts;
 		Object.assign(ctx.envVars, m.envVars);

@@ -42,7 +42,6 @@ export function projectImageName(projectDir) {
 	return `agt-${basename(projectDir)}-${shortHash}`;
 }
 
-
 // --- images ---
 
 export function baseDockerfile() {
@@ -140,12 +139,12 @@ export async function checkImageFresh(image, configFiles) {
 
 // --- mounts ---
 
-export function setupMounts(containerKey) {
+export function setupMounts(containerKey, projectMiseTools = {}) {
 	const cacheDir = join(HOME, ".agt", "cache");
 	const mounts = [];
 	const envVars = {};
 
-	// Package download caches shared across projects (NOT /cache/mise — that's image state)
+	// Package download caches — shared across projects
 	for (const sub of ["pnpm", "npm", "bun"]) {
 		const dir = join(cacheDir, sub);
 		mkdirSync(dir, { recursive: true });
@@ -153,8 +152,28 @@ export function setupMounts(containerKey) {
 		mounts.push([dir, `/cache/${sub}`]);
 	}
 
-	// COW mounts: claude, pi — config drives which files are copied, always refreshed from host
+	// mise tool cache — shared across all containers so installed tools persist
+	const miseDir = join(cacheDir, "mise");
+	mkdirSync(miseDir, { recursive: true });
+	chmodSync(miseDir, 0o777);
+	mounts.push([miseDir, "/cache/mise"]);
+
+	// mise config — merge defaults + project tools, write fresh each run
 	const defaults = loadDefaults();
+	const mergedMiseTools = { ...defaults?.mise?.tools, ...projectMiseTools };
+	if (Object.keys(mergedMiseTools).length > 0) {
+		const tomlKey = (k) => (/^[a-zA-Z0-9_-]+$/.test(k) ? k : `"${k}"`);
+		const toolLines = Object.entries(mergedMiseTools)
+			.map(([k, v]) => `${tomlKey(k)} = "${v}"`)
+			.join("\n");
+		const miseConfigDir = join(HOME, ".agt", "home", containerKey, ".config", "mise");
+		mkdirSync(miseConfigDir, { recursive: true });
+		const miseConfigPath = join(miseConfigDir, "config.toml");
+		writeFileSync(miseConfigPath, `[tools]\n${toolLines}\n`);
+		mounts.push([miseConfigPath, "/home/agt/.config/mise/config.toml"]);
+	}
+
+	// COW mounts: claude, pi — config drives which files are copied, always refreshed from host
 	for (const name of ["claude", "pi"]) {
 		const hostDir = join(HOME, `.${name}`);
 		if (!existsSync(hostDir)) continue;
@@ -169,12 +188,12 @@ export function setupMounts(containerKey) {
 					const isDir = statSync(src).isDirectory();
 					mkdirSync(isDir ? dst : dirname(dst), { recursive: true });
 					debug(`rsync .${name}/${f}`);
-					Bun.spawnSync(["rsync", "-a", "--delete", isDir ? src + "/" : src, dst]);
+					Bun.spawnSync(["rsync", "-rlt", "--no-perms", "--delete", isDir ? src + "/" : src, dst]);
 				}
 			}
 		} else {
-			debug(`cp .${name}/`);
-			Bun.spawnSync(["cp", "-c", "-R", hostDir + "/.", branchDir]);
+			debug(`rsync .${name}/`);
+			Bun.spawnSync(["rsync", "-rlt", "--no-perms", "--delete", hostDir + "/", branchDir]);
 		}
 		// Override credentials file with live Keychain data if configured
 		const keychainSvc = defaults?.[name]?.["keychain-credentials"];
@@ -213,6 +232,8 @@ export function setupMounts(containerKey) {
 		PNPM_HOME: "/cache/pnpm",
 		NPM_CONFIG_CACHE: "/cache/npm",
 		BUN_INSTALL_CACHE_DIR: "/cache/bun",
+		MISE_DATA_DIR: "/cache/mise",
+		MISE_NOT_FOUND_AUTO_INSTALL: "1",
 	});
 
 	return { mounts, envVars };

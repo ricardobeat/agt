@@ -7,3 +7,9 @@ files = ["agents/auth.json", "agents/models.json", "settings.json"]
 
 [home]
 files = [".gitconfig", ".claude.json"]
+
+[mise.tools]
+fd = "latest"
+bun = "latest"
+"aqua:anthropics/claude-code" = "latest"
+"npm:@mariozechner/pi-coding-agent" = "latest"

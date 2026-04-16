@@ -33,17 +33,9 @@ ENV SHELL=/bin/bash
 RUN echo 'PS1="\[\033[33m\]agt »\[\033[0m\] \[\033[1m\]${AGT_BRANCH:-}\[\033[0m\] \w \$ "' >> /home/agt/.bashrc
 ENV MISE_DATA_DIR=/cache/mise
 RUN echo 'export PATH="/cache/mise/shims:$PATH"' >> /home/agt/.bashrc \
- && echo 'export PATH="/cache/mise/shims:$PATH"' | sudo tee /etc/profile.d/mise.sh
+ && echo 'mise activate --shims 2>/dev/null || true' >> /home/agt/.bashrc \
+ && printf 'export PATH="/cache/mise/shims:$PATH"\nmise activate --shims 2>/dev/null || true\n' | sudo tee /etc/profile.d/mise.sh
 RUN sudo mkdir -p /cache/mise && sudo chmod 777 /cache/mise
-RUN mise activate --shims
-
-# Default tools via mise — installed into /cache/mise so the mount persists them
-ENV MISE_NPM_PACKAGE_MANAGER=bun
-RUN mise use -g fd
-RUN mise use -g bun
-
-RUN mise use -g aqua:anthropics/claude-code
-RUN mise use -g npm:@mariozechner/pi-coding-agent
 
 WORKDIR /work
 ENTRYPOINT []
