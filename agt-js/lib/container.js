@@ -1,7 +1,7 @@
 // Container lifecycle — image builds, container management, and execution.
 
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { $ } from "bun";
@@ -178,6 +178,20 @@ export function setupMounts(containerKey) {
 		} else {
 			debug(`cp .${name}/`);
 			Bun.spawnSync(["cp", "-c", "-R", hostDir + "/.", branchDir]);
+		}
+		// Override credentials file with live Keychain data if configured
+		const keychainSvc = defaults?.[name]?.["keychain-credentials"];
+		if (keychainSvc) {
+			const r = Bun.spawnSync(
+				["security", "find-generic-password", "-s", keychainSvc, "-w"],
+				{ stdout: "pipe", stderr: "pipe" },
+			);
+			if (r.exitCode === 0 && r.stdout) {
+				const dst = join(branchDir, ".credentials.json");
+				writeFileSync(dst, r.stdout.toString().trim());
+				chmodSync(dst, 0o600);
+				debug(`keychain ${name}/.credentials.json`);
+			}
 		}
 		mounts.push([branchDir, `/home/agt/.${name}`]);
 	}

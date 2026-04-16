@@ -1,5 +1,6 @@
 [claude]
 files = ["settings.json", "settings.local.json", "plugins", "agents", "skills", ".credentials.json"]
+keychain-credentials = "Claude Code-credentials"
 
 [pi]
 files = ["agents/auth.json", "agents/models.json", "settings.json"]
