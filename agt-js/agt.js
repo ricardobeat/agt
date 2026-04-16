@@ -18,7 +18,6 @@ import { promptBranchName } from "./lib/cli.js";
 import { debug, enableDebug } from "./lib/debug.js";
 import {
 	baseDockerfile,
-	branchImageName,
 	buildImage,
 	checkImageFresh,
 	cleanContainer,
@@ -259,7 +258,6 @@ async function setup(args) {
 			ctx.projectImage = DEFAULT_IMAGE;
 		}
 
-		ctx.branchImage = branchImageName(root ?? process.cwd(), ctx.branch);
 	}
 
 	debug(`setupWorktree ${ctx.branch}`);
@@ -393,7 +391,7 @@ async function cmdEnter(args) {
 
 async function cmdClean(branch) {
 	const root = (await gitRoot()) || fatal("Not inside a git repository");
-	await cleanContainer(branch, branchImageName(root, branch));
+	await cleanContainer(branch);
 	try {
 		await removeWorktree(root, branch);
 	} catch (e) {
@@ -402,5 +400,5 @@ async function cmdClean(branch) {
 	const homeDir = join(HOME, ".agt", "home", `${projectImageName(root)}-${branch}`);
 	if (existsSync(homeDir)) rmSync(homeDir, { recursive: true });
 	console.log(pc.green(`Removed worktree at ${worktreePath(root, branch)}`));
-	console.log(pc.green(`Cleaned up ${branch}`));
+	console.log(pc.green(`Branch ${branch} is still available`));
 }

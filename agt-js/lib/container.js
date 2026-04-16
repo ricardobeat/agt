@@ -42,9 +42,6 @@ export function projectImageName(projectDir) {
 	return `agt-${basename(projectDir)}-${shortHash}`;
 }
 
-export function branchImageName(projectDir, branch) {
-	return `${projectImageName(projectDir)}:${branch}`;
-}
 
 // --- images ---
 
@@ -238,7 +235,6 @@ export async function runContainer({
 	cname,
 	branch,
 	projectImage,
-	branchImage,
 	worktree,
 	gitDir,
 	mounts,
@@ -249,12 +245,6 @@ export async function runContainer({
 	cmd,
 }) {
 	envVars.AGT_BRANCH = branch;
-
-	// Check if branch-specific image exists, otherwise use project base
-	const imageExists = await $`container image inspect ${branchImage}`
-		.nothrow()
-		.quiet();
-	const image = imageExists.exitCode === 0 ? branchImage : projectImage;
 
 	const runArgs = [
 		"container",
@@ -283,24 +273,13 @@ export async function runContainer({
 	const finalCmd = cmd[0].startsWith("/")
 		? cmd
 		: ["/bin/bash", "--login", "-c", 'exec "$@"', "--", ...cmd];
-	runArgs.push(...envFlags(envVars), "-w", "/work", image, ...finalCmd);
+	runArgs.push(...envFlags(envVars), "-w", "/work", projectImage, ...finalCmd);
 
 	const proc = Bun.spawn(runArgs, {
 		stdio: ["inherit", "inherit", "inherit"],
 	});
 
-	const cleanup = async (signal) => {
-		await $`container rm -f ${cname}`.nothrow().quiet();
-		process.exit(signal === "SIGINT" ? 130 : 143);
-	};
-	process.once("SIGINT", () => cleanup("SIGINT"));
-	process.once("SIGTERM", () => cleanup("SIGTERM"));
-
 	const exitCode = await proc.exited;
-
-	// Commit container state to branch-specific image
-	await $`container commit ${cname} ${branchImage}`.nothrow().quiet();
-
 	process.exit(exitCode);
 }
 
@@ -334,9 +313,8 @@ export async function listContainers(projectImage) {
 	}
 }
 
-export async function cleanContainer(branch, branchImage) {
+export async function cleanContainer(branch) {
 	const cname = containerName(branch);
 	await $`container stop ${cname}`.nothrow().quiet();
 	await $`container rm ${cname}`.nothrow().quiet();
-	if (branchImage) await $`container image rm ${branchImage}`.nothrow().quiet();
 }
