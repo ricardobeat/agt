@@ -83,6 +83,9 @@ Config file (agt.toml) is loaded from ./agt.toml or ~/.config/agt/config.toml:
   [worktree]
   clone = [".secrets"]      # extra paths to clone into worktrees
 
+  [sandbox]
+  deny = ["~/work/secrets"] # extra paths to deny (sandbox mode only, supports ~/)
+
 Examples:
   agt start my-feature
   agt enter my-feature
@@ -190,6 +193,7 @@ async function setup(args) {
 
 			ctx.clonePaths = toml?.worktree?.clone ?? [];
 			ctx.miseTools = toml?.mise?.tools ?? {};
+			ctx.sandboxDenyPaths = [].concat(toml?.sandbox?.deny ?? []);
 		} catch {}
 
 	while (args[0]?.startsWith("--")) {
@@ -290,13 +294,12 @@ async function setupWorktree(ctx, modeOverride) {
 	const root = await gitRoot();
 	if (!root || !(await hasGitHistory(root))) {
 		ctx.worktree = process.cwd();
-		ctx.gitRootPath = ctx.gitDir = null;
+		ctx.gitRootPath = null;
 		console.log(pc.bold("Using current directory as workspace"));
 		return;
 	}
 
 	ctx.gitRootPath = root;
-	ctx.gitDir = join(root, ".git");
 
 	let result;
 	try {
@@ -338,7 +341,9 @@ function execSandbox(ctx, cmd) {
 	const profileFile = `/tmp/agt-sandbox.${process.pid}.sb`;
 	writeFileSync(
 		profileFile,
-		renderSandboxProfile(ctx.worktree, ctx.gitRootPath),
+		renderSandboxProfile(ctx.worktree, ctx.gitRootPath, {
+			extraDenyPaths: ctx.sandboxDenyPaths ?? [],
+		}),
 	);
 
 	console.log(
@@ -349,27 +354,20 @@ function execSandbox(ctx, cmd) {
 	mkdirSync(zdotdir, { recursive: true });
 	writeFileSync(
 		join(zdotdir, ".zshrc"),
-		`[[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc"\nPROMPT="%F{yellow}[sandbox]%f $PROMPT"\n`,
+		`[[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc"\nPROMPT="%F{yellow}[agt]%f $PROMPT"\n`,
 	);
 
-	const envArgs = Object.entries(ctx.envVars).map(([k, v]) => `${k}=${v}`);
-	const args = [
-		"sandbox-exec",
-		"-f",
-		profileFile,
-		"/usr/bin/env",
-		"AGT_SANDBOX=1",
-		`ZDOTDIR=${zdotdir}`,
-		...envArgs,
-		"/bin/zsh",
-		"-c",
-		`cd '${ctx.worktree}' && exec "$@"`,
-		"--",
-		...cmd,
-	];
-	const { exitCode } = Bun.spawnSync(args, {
-		stdio: ["inherit", "inherit", "inherit"],
-	});
+	const shell = process.env.SHELL ?? "/bin/zsh";
+	const shellArgs = cmd.length ? ["-l", "-c", 'exec "$@"', "--", ...cmd] : ["-l"];
+
+	const { exitCode } = Bun.spawnSync(
+		["sandbox-exec", "-f", profileFile, shell, ...shellArgs],
+		{
+			stdio: ["inherit", "inherit", "inherit"],
+			cwd: ctx.worktree,
+			env: { ...process.env, AGT_SANDBOX: "1", ZDOTDIR: zdotdir, ...ctx.envVars },
+		},
+	);
 	process.exit(exitCode);
 }
 
