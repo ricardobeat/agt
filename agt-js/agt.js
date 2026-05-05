@@ -196,24 +196,28 @@ async function setup(args) {
 			ctx.sandboxDenyPaths = [].concat(toml?.sandbox?.deny ?? []);
 		} catch {}
 
-	while (args[0]?.startsWith("--")) {
-		const flag = args.shift();
-		if (flag === "--image") {
+	// Extract known flags from anywhere in args; leave positional args in place.
+	const positional = [];
+	while (args.length) {
+		const a = args.shift();
+		if (a === "--image") {
 			ctx.projectImage = args.shift();
 			ctx.imageOverride = true;
-		} else if (flag === "--mode") {
+		} else if (a === "--mode") {
 			ctx.mode = args.shift();
 			modeOverride = true;
-		} else if (flag === "--debug") {
+		} else if (a === "--debug") {
 			enableDebug();
+		} else {
+			positional.push(a);
 		}
 	}
-	if (!args.length || !args[0] || args[0].startsWith("--")) {
+	if (!positional.length) {
 		ctx.branch = await promptBranchName();
 	} else {
-		ctx.branch = args.shift();
+		ctx.branch = positional.shift();
 	}
-	ctx.remainingArgs = args;
+	ctx.remainingArgs = positional;
 	ctx.cname = containerName(ctx.branch);
 	ctx.envVars.AGT_NAME = ctx.cname;
 
