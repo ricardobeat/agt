@@ -10,6 +10,7 @@
 	},
 	"dependencies": {
 		"@opentui/core": "^0.1.98",
+		"citty": "^0.2.2",
 		"memorable-ids": "^0.2.0"
 	}
 }
