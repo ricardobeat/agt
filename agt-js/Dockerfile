@@ -33,8 +33,9 @@ ENV SHELL=/bin/bash
 RUN echo 'PS1="\[\033[33m\]agt »\[\033[0m\] \[\033[1m\]${AGT_BRANCH:-}\[\033[0m\] \w \$ "' >> /home/agt/.bashrc
 ENV MISE_DATA_DIR=/cache/mise
 RUN echo 'export PATH="/cache/mise/shims:$PATH"' >> /home/agt/.bashrc \
- && echo 'mise activate --shims 2>/dev/null || true' >> /home/agt/.bashrc \
- && printf 'export PATH="/cache/mise/shims:$PATH"\nmise activate --shims 2>/dev/null || true\n' | sudo tee /etc/profile.d/mise.sh
+ && echo 'mise install --quiet 2>/dev/null || true' >> /home/agt/.bashrc \
+ && echo 'export PATH="/cache/mise/shims:$PATH"' | sudo tee -a /etc/profile \
+ && echo 'mise install --quiet 2>/dev/null || true' | sudo tee -a /etc/profile
 RUN sudo mkdir -p /cache/mise && sudo chmod 777 /cache/mise
 
 WORKDIR /work

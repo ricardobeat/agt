@@ -195,20 +195,20 @@ export function setupMounts(containerKey, projectMiseTools = {}) {
 			debug(`rsync .${name}/`);
 			Bun.spawnSync(["rsync", "-rlt", "--no-perms", "--delete", hostDir + "/", branchDir]);
 		}
-		// Override credentials file with live Keychain data if configured
-		const keychainSvc = defaults?.[name]?.["keychain-credentials"];
-		if (keychainSvc) {
-			const r = Bun.spawnSync(
-				["security", "find-generic-password", "-s", keychainSvc, "-w"],
-				{ stdout: "pipe", stderr: "pipe" },
-			);
-			if (r.exitCode === 0 && r.stdout) {
-				const dst = join(branchDir, ".credentials.json");
-				writeFileSync(dst, r.stdout.toString().trim());
-				chmodSync(dst, 0o600);
-				debug(`keychain ${name}/.credentials.json`);
-			}
-		}
+		// // Override credentials file with live Keychain data if configured
+		// const keychainSvc = defaults?.[name]?.["keychain-credentials"];
+		// if (keychainSvc) {
+		// 	const r = Bun.spawnSync(
+		// 		["security", "find-generic-password", "-s", keychainSvc, "-w"],
+		// 		{ stdout: "pipe", stderr: "pipe" },
+		// 	);
+		// 	if (r.exitCode === 0 && r.stdout) {
+		// 		const dst = join(branchDir, ".credentials.json");
+		// 		writeFileSync(dst, r.stdout.toString().trim());
+		// 		chmodSync(dst, 0o600);
+		// 		debug(`keychain ${name}/.credentials.json`);
+		// 	}
+		// }
 		mounts.push([branchDir, `/home/agt/.${name}`]);
 	}
 
@@ -236,6 +236,10 @@ export function setupMounts(containerKey, projectMiseTools = {}) {
 		MISE_NOT_FOUND_AUTO_INSTALL: "1",
 	});
 
+	for (const key of defaults?.home?.env ?? []) {
+		if (process.env[key] !== undefined) envVars[key] = process.env[key];
+	}
+
 	return { mounts, envVars };
 }
 
@@ -257,7 +261,7 @@ export async function runContainer({
 	branch,
 	projectImage,
 	worktree,
-	gitDir,
+	gitRootPath,
 	mounts,
 	envVars,
 	cpus,
@@ -285,7 +289,8 @@ export async function runContainer({
 		"-v",
 		`${worktree}:/work`,
 	];
-	if (gitDir) runArgs.push("-v", `${gitDir}:${gitDir}`);
+	// Mount the full git root so that the absolute gitdir pointer in the worktree's .git file resolves correctly.
+	if (gitRootPath) runArgs.push("-v", `${gitRootPath}:${gitRootPath}:ro`);
 	for (const [src, dst, mode] of mounts) {
 		runArgs.push("-v", mode ? `${src}:${dst}:${mode}` : `${src}:${dst}`);
 	}
